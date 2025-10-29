@@ -18,6 +18,7 @@
 package fr.redfroggy.keycloak.requiredactions;
 
 import jakarta.ws.rs.core.MultivaluedMap;
+import org.keycloak.models.AuthenticationExecutionModel;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 import org.keycloak.authentication.ConfigurableAuthenticatorFactory;
