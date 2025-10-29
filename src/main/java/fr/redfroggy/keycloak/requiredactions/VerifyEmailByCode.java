@@ -18,11 +18,12 @@
 package fr.redfroggy.keycloak.requiredactions;
 
 import jakarta.ws.rs.core.MultivaluedMap;
-import org.keycloak.models.AuthenticationExecutionModel;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriBuilderException;
 import org.jboss.logging.Logger;
-import org.keycloak.authentication.ConfigurableAuthenticatorFactory;
+import org.keycloak.Config;
 import org.keycloak.authentication.RequiredActionContext;
+import org.keycloak.authentication.RequiredActionFactory;
 import org.keycloak.authentication.RequiredActionProvider;
 import org.keycloak.common.util.SecretGenerator;
 import org.keycloak.email.EmailException;
@@ -33,51 +34,40 @@ import org.keycloak.events.Errors;
 import org.keycloak.events.EventBuilder;
 import org.keycloak.events.EventType;
 import org.keycloak.forms.login.LoginFormsProvider;
-import org.keycloak.models.AuthenticatorConfigModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 import org.keycloak.models.utils.FormMessage;
-import org.keycloak.provider.ProviderConfigProperty;
 import org.keycloak.provider.ServerInfoAwareProviderFactory;
 import org.keycloak.services.validation.Validation;
 import org.keycloak.sessions.AuthenticationSessionModel;
 
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /**
- * Required action to verify email using a time-limited code sent via email.
- * Supports dynamic configuration in Keycloak Admin Console.
+ * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+ * @version $Revision: 1 $
  */
-public class VerifyEmailByCode implements RequiredActionProvider,
-        ConfigurableAuthenticatorFactory,
-        ServerInfoAwareProviderFactory {
-
+public class VerifyEmailByCode implements RequiredActionProvider, RequiredActionFactory, ServerInfoAwareProviderFactory {
     public static final String VERIFY_EMAIL_CODE = "VERIFY_EMAIL_CODE";
-    public static final String VERIFY_EMAIL_CODE_TIMESTAMP = "VERIFY_EMAIL_CODE_TIMESTAMP";
     public static final String EMAIL_CODE = "email_code";
     public static final String INVALID_CODE = "VerifyEmailInvalidCode";
+    public static final String EXPIRED_CODE = "VerifyEmailExpiredCode"; // 保留，用于错误消息
     public static final String LOGIN_VERIFY_EMAIL_CODE_TEMPLATE = "login-verify-email-code.ftl";
-
-    // Config keys
-    public static final String CONFIG_CODE_LENGTH = "code-length";
-    public static final String CONFIG_CODE_SYMBOLS = "code-symbols";
-    public static final String CONFIG_CODE_TTL = "code-ttl"; // in seconds
-
-    // Defaults
+    // 移除 CONFIG_* 常量
     public static final int DEFAULT_CODE_LENGTH = 8;
     public static final String DEFAULT_CODE_SYMBOLS = String.valueOf(SecretGenerator.ALPHANUM);
-    public static final long DEFAULT_CODE_TTL_SECONDS = 300; // 5 minutes
-
+    public static final int DEFAULT_CODE_TTL_SECONDS = 300; // 5 minutes
     private static final Logger logger = Logger.getLogger(VerifyEmailByCode.class);
+    // 移除实例变量 codeLength, codeSymbols, codeTtlSeconds
+    // private int codeLength;
+    // private String codeSymbols;
+    // private int codeTtlSeconds;
 
-    // --- RequiredActionProvider methods ---
 
     private static void createFormChallenge(RequiredActionContext context, FormMessage errorMessage) {
         LoginFormsProvider loginFormsProvider = context.form();
@@ -92,7 +82,8 @@ public class VerifyEmailByCode implements RequiredActionProvider,
 
     @Override
     public void evaluateTriggers(RequiredActionContext context) {
-        if (context.getRealm().isVerifyEmail() && !context.getUser().isEmailVerified()) {
+        if (context.getRealm().isVerifyEmail()
+                && !context.getUser().isEmailVerified()) {
             context.getUser().addRequiredAction(VERIFY_EMAIL_CODE);
             logger.debug("User is required to verify email");
         }
@@ -101,9 +92,8 @@ public class VerifyEmailByCode implements RequiredActionProvider,
     @Override
     public void requiredActionChallenge(RequiredActionContext context) {
         if (context.getUser().isEmailVerified()) {
-            AuthenticationSessionModel authSession = context.getAuthenticationSession();
-            authSession.removeAuthNote(VERIFY_EMAIL_CODE);
-            authSession.removeAuthNote(VERIFY_EMAIL_CODE_TIMESTAMP);
+            context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
+            context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE + "_EXP"); // 确保清理过期时间
             context.success();
             return;
         }
@@ -114,56 +104,35 @@ public class VerifyEmailByCode implements RequiredActionProvider,
             return;
         }
 
-        AuthenticationSessionModel authSession = context.getAuthenticationSession();
-        String existingCode = authSession.getAuthNote(VERIFY_EMAIL_CODE);
-        String timestampStr = authSession.getAuthNote(VERIFY_EMAIL_CODE_TIMESTAMP);
-        long codeTtlMillis = getCodeTtlMillis(context);
-
-        boolean codeValid = false;
-        if (existingCode != null && timestampStr != null) {
-            try {
-                long sendTime = Long.parseLong(timestampStr);
-                if (System.currentTimeMillis() - sendTime < codeTtlMillis) {
-                    codeValid = true;
-                }
-            } catch (NumberFormatException ignored) {
-                // invalid timestamp → treat as expired
-            }
-        }
-
-        if (codeValid) {
-            createFormChallenge(context, null);
-        } else {
-            sendVerifyEmailAndCreateForm(context);
-        }
+        // Only send the code if it does not exist or is expired. This avoids resending on language switch.
+        sendVerifyEmailIfNeededAndCreateForm(context);
     }
 
     @Override
     public void processAction(RequiredActionContext context) {
         EventBuilder event = context.getEvent().clone().event(EventType.VERIFY_EMAIL).detail(Details.EMAIL, context.getUser().getEmail());
         AuthenticationSessionModel authSession = context.getAuthenticationSession();
-
         String code = authSession.getAuthNote(VERIFY_EMAIL_CODE);
-        String timestampStr = authSession.getAuthNote(VERIFY_EMAIL_CODE_TIMESTAMP);
-        long codeTtlMillis = getCodeTtlMillis(context);
-
-        boolean codeExpired = true;
-        if (code != null && timestampStr != null) {
-            try {
-                long sendTime = Long.parseLong(timestampStr);
-                if (System.currentTimeMillis() - sendTime < codeTtlMillis) {
-                    codeExpired = false;
-                }
-            } catch (NumberFormatException ignored) {
-            }
-        }
-
-        if (code == null || codeExpired) {
-            requiredActionChallenge(context);
-            event.error("code_expired_or_missing");
+        String expireAtMsStr = authSession.getAuthNote(VERIFY_EMAIL_CODE + "_EXP");
+        if (code == null) {
+            requiredActionChallenge(context); // Should not happen if UI is consistent, but handle gracefully
             return;
         }
-
+        // Check expiration
+        if (expireAtMsStr != null) {
+            try {
+                long expireAtMs = Long.parseLong(expireAtMsStr);
+                if (System.currentTimeMillis() >= expireAtMs) {
+                    createFormChallenge(context, new FormMessage(EMAIL_CODE, EXPIRED_CODE));
+                    // regenerate and send a fresh code for the next attempt
+                    sendNewVerificationCode(context);
+                    return;
+                }
+            } catch (NumberFormatException ignored) {
+                logger.warn("Stored expiration time for verification code is malformed, proceeding without expiration check.");
+                // proceed without expiration if stored value is malformed
+            }
+        }
         MultivaluedMap<String, String> formData = context.getHttpRequest().getDecodedFormParameters();
         String emailCode = formData.getFirst(EMAIL_CODE);
 
@@ -172,10 +141,9 @@ public class VerifyEmailByCode implements RequiredActionProvider,
             event.error(INVALID_CODE);
             return;
         }
-
         context.getUser().setEmailVerified(true);
         authSession.removeAuthNote(VERIFY_EMAIL_CODE);
-        authSession.removeAuthNote(VERIFY_EMAIL_CODE_TIMESTAMP);
+        authSession.removeAuthNote(VERIFY_EMAIL_CODE + "_EXP");
         event.success();
         context.success();
     }
@@ -185,172 +153,108 @@ public class VerifyEmailByCode implements RequiredActionProvider,
         return this;
     }
 
-    // --- ConfigurableAuthenticatorFactory methods ---
+    @Override
+    public void init(Config.Scope config) {
+        // 固定配置：不再从 Keycloak 控制台动态读取
+        // 无需设置实例变量，直接在使用处引用 DEFAULT_* 常量
+    }
+
+    @Override
+    public void postInit(KeycloakSessionFactory factory) {
+
+    }
+
+    @Override
+    public void close() {
+
+    }
 
     @Override
     public String getId() {
         return VERIFY_EMAIL_CODE;
     }
 
-    @Override
-    public String getDisplayText() {
-        return "Verify Email by code";
-    }
-
-    @Override
-    public boolean isConfigurable() {
-        return true;
-    }
-
-    @Override
-    public AuthenticationExecutionModel.Requirement[] getRequirementChoices() {
-        return new AuthenticationExecutionModel.Requirement[]{
-            AuthenticationExecutionModel.Requirement.REQUIRED,
-            AuthenticationExecutionModel.Requirement.ALTERNATIVE,
-            AuthenticationExecutionModel.Requirement.DISABLED
-        };
-    }
-
-    private static final List<ProviderConfigProperty> CONFIG_PROPERTIES = Arrays.asList(
-        new ProviderConfigProperty(
-            CONFIG_CODE_LENGTH,
-            "Code Length",
-            "Length of the verification code (e.g., 6)",
-            ProviderConfigProperty.STRING_TYPE,
-            String.valueOf(DEFAULT_CODE_LENGTH)
-        ),
-        new ProviderConfigProperty(
-            CONFIG_CODE_SYMBOLS,
-            "Code Symbols",
-            "Characters allowed in the code (e.g., 0123456789)",
-            ProviderConfigProperty.STRING_TYPE,
-            DEFAULT_CODE_SYMBOLS
-        ),
-        new ProviderConfigProperty(
-            CONFIG_CODE_TTL,
-            "Code TTL (seconds)",
-            "Time-to-live of the verification code in seconds (e.g., 300)",
-            ProviderConfigProperty.STRING_TYPE,
-            String.valueOf(DEFAULT_CODE_TTL_SECONDS)
-        )
-    );
-
-    @Override
-    public List<ProviderConfigProperty> getConfigProperties() {
-        return CONFIG_PROPERTIES;
-    }
-
-    // --- Helper methods for config parsing ---
-
-    private int getCodeLength(RequiredActionContext context) {
-        String val = getAuthenticatorConfigProperty(context, CONFIG_CODE_LENGTH);
-        return parsePositiveInt(val, DEFAULT_CODE_LENGTH);
-    }
-
-    private String getCodeSymbols(RequiredActionContext context) {
-        String val = getAuthenticatorConfigProperty(context, CONFIG_CODE_SYMBOLS);
-        return (val != null && !val.isEmpty()) ? val : DEFAULT_CODE_SYMBOLS;
-    }
-
-    private long getCodeTtlMillis(RequiredActionContext context) {
-        String val = getAuthenticatorConfigProperty(context, CONFIG_CODE_TTL);
-        long seconds = parsePositiveLong(val, DEFAULT_CODE_TTL_SECONDS);
-        return Math.max(1000, seconds * 1000); // min 1 second
-    }
-
-    private String getAuthenticatorConfigProperty(RequiredActionContext context, String key) {
-        AuthenticatorConfigModel configModel = context.getAuthenticatorConfig();
-        if (configModel != null && configModel.getConfig() != null) {
-            return configModel.getConfig().get(key);
-        }
-        return null;
-    }
-
-    private static int parsePositiveInt(String str, int defaultValue) {
-        if (str == null || str.trim().isEmpty()) return defaultValue;
-        try {
-            int val = Integer.parseInt(str.trim());
-            return val > 0 ? val : defaultValue;
-        } catch (NumberFormatException e) {
-            return defaultValue;
-        }
-    }
-
-    private static long parsePositiveLong(String str, long defaultValue) {
-        if (str == null || str.trim().isEmpty()) return defaultValue;
-        try {
-            long val = Long.parseLong(str.trim());
-            return val > 0 ? val : defaultValue;
-        } catch (NumberFormatException e) {
-            return defaultValue;
-        }
-    }
-
-    // --- Email sending logic ---
-
-    private void sendVerifyEmailAndCreateForm(RequiredActionContext context) {
+    private void sendVerifyEmailIfNeededAndCreateForm(RequiredActionContext context) throws UriBuilderException, IllegalArgumentException {
         KeycloakSession session = context.getSession();
         UserModel user = context.getUser();
         AuthenticationSessionModel authSession = context.getAuthenticationSession();
-        EventBuilder event = context.getEvent().clone()
-                .event(EventType.SEND_VERIFY_EMAIL)
-                .detail(Details.EMAIL, user.getEmail());
+        EventBuilder event = context.getEvent().clone().event(EventType.SEND_VERIFY_EMAIL).detail(Details.EMAIL, user.getEmail());
 
-        int codeLength = getCodeLength(context);
-        String codeSymbols = getCodeSymbols(context);
-        String code = SecretGenerator.getInstance().randomString(codeLength, codeSymbols.toCharArray());
-        long timestamp = System.currentTimeMillis();
-
-        authSession.setAuthNote(VERIFY_EMAIL_CODE, code);
-        authSession.setAuthNote(VERIFY_EMAIL_CODE_TIMESTAMP, String.valueOf(timestamp));
-
+        String existingCode = authSession.getAuthNote(VERIFY_EMAIL_CODE);
+        String expireAtMsStr = authSession.getAuthNote(VERIFY_EMAIL_CODE + "_EXP");
+        boolean shouldSend = true;
+        long now = System.currentTimeMillis();
+        if (existingCode != null && expireAtMsStr != null) {
+            try {
+                long expireAtMs = Long.parseLong(expireAtMsStr);
+                if (now < expireAtMs) {
+                    shouldSend = false; // still valid; don't resend
+                }
+            } catch (NumberFormatException ignored) {
+                logger.warn("Stored expiration time for verification code is malformed, will regenerate code.");
+                // fall through and regenerate
+            }
+        }
+        String code;
+        if (shouldSend) {
+            code = SecretGenerator.getInstance().randomString(DEFAULT_CODE_LENGTH, DEFAULT_CODE_SYMBOLS.toCharArray());
+            authSession.setAuthNote(VERIFY_EMAIL_CODE, code);
+            long expireAtMs = now + (DEFAULT_CODE_TTL_SECONDS * 1000L);
+            authSession.setAuthNote(VERIFY_EMAIL_CODE + "_EXP", String.valueOf(expireAtMs));
+        } else {
+            code = existingCode;
+        }
         RealmModel realm = session.getContext().getRealm();
+
         Map<String, Object> attributes = new HashMap<>();
         attributes.put("code", code);
 
         LoginFormsProvider form = context.form();
-        try {
-            session.getProvider(EmailTemplateProvider.class)
-                    .setAuthenticationSession(authSession)
-                    .setRealm(realm)
-                    .setUser(user)
-                    .send("emailVerificationSubject", "email-verification-with-code.ftl", attributes);
-            event.success();
-        } catch (EmailException e) {
-            logger.error("Failed to send verification email", e);
-            event.error(Errors.EMAIL_SEND_FAILED);
-            form.setError(Errors.EMAIL_SEND_FAILED);
+        if (shouldSend) {
+            try {
+                session
+                        .getProvider(EmailTemplateProvider.class)
+                        .setAuthenticationSession(authSession)
+                        .setRealm(realm)
+                        .setUser(user)
+                        .send("emailVerificationSubject", "email-verification-with-code.ftl", attributes);
+                event.success();
+            } catch (EmailException e) {
+                logger.error("Failed to send verification email", e);
+                event.error(Errors.EMAIL_SEND_FAILED);
+                form.setError(Errors.EMAIL_SEND_FAILED);
+            }
         }
 
         createFormChallenge(context, null);
     }
 
-    // --- ServerInfoAwareProviderFactory ---
-
-    @Override
-    public void init(org.keycloak.Config.Scope config) {
-        // Optional: global fallback (not used when dynamic config is set)
+    private void sendNewVerificationCode(RequiredActionContext context) {
+        // Helper to regenerate and send a fresh code (used on expiration)
+        AuthenticationSessionModel authSession = context.getAuthenticationSession();
+        authSession.removeAuthNote(VERIFY_EMAIL_CODE);
+        authSession.removeAuthNote(VERIFY_EMAIL_CODE + "_EXP");
+        // Call sendVerifyEmailIfNeededAndCreateForm which will definitely send a new code now that old ones are removed
+        sendVerifyEmailIfNeededAndCreateForm(context);
     }
 
-    @Override
-    public void postInit(KeycloakSessionFactory factory) {
-        // no-op
-    }
 
     @Override
-    public void close() {
-        // no-op
+    public String getDisplayText() {
+        logger.info("Retrieved display text for VerifyEmailByCode");
+        return "Verify Email by code";
     }
 
     @Override
     public Map<String, String> getOperationalInfo() {
-        // Operational info is per-instance, but config is dynamic.
-        // We cannot show effective config here reliably.
-        // Return empty or static defaults if needed.
+        // 既然配置已固定，OperationalInfo 可以反映这一点，或者简化
+        // 保持原有输出，但明确是固定值
         Map<String, String> ret = new LinkedHashMap<>();
-        ret.put("default." + CONFIG_CODE_LENGTH, String.valueOf(DEFAULT_CODE_LENGTH));
-        ret.put("default." + CONFIG_CODE_SYMBOLS, DEFAULT_CODE_SYMBOLS);
-        ret.put("default." + CONFIG_CODE_TTL, String.valueOf(DEFAULT_CODE_TTL_SECONDS));
+        ret.put("Fixed Code Length", String.valueOf(DEFAULT_CODE_LENGTH));
+        ret.put("Fixed Code Symbols", DEFAULT_CODE_SYMBOLS);
+        ret.put("Fixed Code TTL (seconds)", String.valueOf(DEFAULT_CODE_TTL_SECONDS));
         return ret;
     }
+
+    // 已移除控制台可配置项定义
 }
