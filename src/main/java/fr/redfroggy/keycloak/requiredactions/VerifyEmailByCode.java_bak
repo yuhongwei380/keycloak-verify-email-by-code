@@ -19,6 +19,7 @@ package fr.redfroggy.keycloak.requiredactions;
 
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriBuilderException;
 import org.jboss.logging.Logger;
 import org.keycloak.Config;
 import org.keycloak.authentication.RequiredActionContext;
@@ -48,37 +49,18 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Required action that verifies user's email by sending a verification code.
+ * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
+ * @version $Revision: 1 $
  */
 public class VerifyEmailByCode implements RequiredActionProvider, RequiredActionFactory, ServerInfoAwareProviderFactory {
-
-    /** Provider ID for this required action */
     public static final String VERIFY_EMAIL_CODE = "VERIFY_EMAIL_CODE";
-    
-    /** Authentication session note key for email verification timestamp */
-    public static final String VERIFY_EMAIL_CODE_TS = VERIFY_EMAIL_CODE + "_ts";
-    
-    /** Form parameter name for the email verification code */
     public static final String EMAIL_CODE = "email_code";
-    
-    /** Error message key for invalid verification code */
     public static final String INVALID_CODE = "VerifyEmailInvalidCode";
-    
-    /** Template name for the verification code input form */
     public static final String LOGIN_VERIFY_EMAIL_CODE_TEMPLATE = "login-verify-email-code.ftl";
-    
-    /** Configuration key for the length of the verification code */
     public static final String CONFIG_CODE_LENGTH = "code-length";
-    
-    /** Configuration key for the character set used to generate the code */
     public static final String CONFIG_CODE_SYMBOLS = "code-symbols";
-    
-    /** Default length of the verification code */
     public static final int DEFAULT_CODE_LENGTH = 8;
-    
-    /** Default character set for the verification code (alphanumeric) */
     public static final String DEFAULT_CODE_SYMBOLS = String.valueOf(SecretGenerator.ALPHANUM);
-
     private static final Logger logger = Logger.getLogger(VerifyEmailByCode.class);
     private int codeLength;
     private String codeSymbols;
@@ -107,7 +89,6 @@ public class VerifyEmailByCode implements RequiredActionProvider, RequiredAction
     public void requiredActionChallenge(RequiredActionContext context) {
         if (context.getUser().isEmailVerified()) {
             context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
-            context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
             context.success();
             return;
         }
@@ -118,64 +99,27 @@ public class VerifyEmailByCode implements RequiredActionProvider, RequiredAction
             return;
         }
 
-        String storedCode = context.getAuthenticationSession().getAuthNote(VERIFY_EMAIL_CODE);
-        String storedTimeStr = context.getAuthenticationSession().getAuthNote(VERIFY_EMAIL_CODE_TS);
-
-        // 检查验证码是否过期（5分钟）
-        if (storedCode != null && storedTimeStr != null) {
-            try {
-                long sentAt = Long.parseLong(storedTimeStr);
-                long now = System.currentTimeMillis();
-                if (now - sentAt > 5 * 60 * 1000) {
-                    // 过期，清除
-                    context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
-                    context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
-                    storedCode = null;
-                }
-            } catch (NumberFormatException e) {
-                // 时间戳无效，视为过期
-                context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
-                context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
-                storedCode = null;
-            }
-        }
-
-        if (storedCode == null) {
-            sendVerifyEmailAndCreateForm(context);
-        } else {
-            createFormChallenge(context, null);
-        }
+        sendVerifyEmailAndCreateForm(context);
     }
 
     @Override
     public void processAction(RequiredActionContext context) {
         EventBuilder event = context.getEvent().clone().event(EventType.VERIFY_EMAIL).detail(Details.EMAIL, context.getUser().getEmail());
-        MultivaluedMap<String, String> formData = context.getHttpRequest().getDecodedFormParameters();
-
-        // 处理重发请求
-        if ("true".equals(formData.getFirst("resend"))) {
-            context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
-            context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
-            sendVerifyEmailAndCreateForm(context);
-            return;
-        }
-
         String code = context.getAuthenticationSession().getAuthNote(VERIFY_EMAIL_CODE);
         if (code == null) {
             requiredActionChallenge(context);
             return;
         }
-
+        MultivaluedMap<String, String> formData = context.getHttpRequest().getDecodedFormParameters();
         String emailCode = formData.getFirst(EMAIL_CODE);
+
         if (!code.equals(emailCode)) {
             createFormChallenge(context, new FormMessage(EMAIL_CODE, INVALID_CODE));
             event.error(INVALID_CODE);
             return;
         }
-
         context.getUser().setEmailVerified(true);
         context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
-        context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
         event.success();
         context.success();
     }
@@ -193,10 +137,12 @@ public class VerifyEmailByCode implements RequiredActionProvider, RequiredAction
 
     @Override
     public void postInit(KeycloakSessionFactory factory) {
+
     }
 
     @Override
     public void close() {
+
     }
 
     @Override
@@ -204,19 +150,15 @@ public class VerifyEmailByCode implements RequiredActionProvider, RequiredAction
         return VERIFY_EMAIL_CODE;
     }
 
-    private void sendVerifyEmailAndCreateForm(RequiredActionContext context) {
+    private void sendVerifyEmailAndCreateForm(RequiredActionContext context) throws UriBuilderException, IllegalArgumentException {
         KeycloakSession session = context.getSession();
         UserModel user = context.getUser();
         AuthenticationSessionModel authSession = context.getAuthenticationSession();
         EventBuilder event = context.getEvent().clone().event(EventType.SEND_VERIFY_EMAIL).detail(Details.EMAIL, user.getEmail());
-
         String code = SecretGenerator.getInstance().randomString(codeLength, codeSymbols.toCharArray());
-        long now = System.currentTimeMillis();
-
         authSession.setAuthNote(VERIFY_EMAIL_CODE, code);
-        authSession.setAuthNote(VERIFY_EMAIL_CODE_TS, String.valueOf(now));
-
         RealmModel realm = session.getContext().getRealm();
+
         Map<String, Object> attributes = new HashMap<>();
         attributes.put("code", code);
 
@@ -240,6 +182,7 @@ public class VerifyEmailByCode implements RequiredActionProvider, RequiredAction
 
     @Override
     public String getDisplayText() {
+        logger.info("Retrieved display text for VerifyEmailByCode");
         return "Verify Email by code";
     }
 
