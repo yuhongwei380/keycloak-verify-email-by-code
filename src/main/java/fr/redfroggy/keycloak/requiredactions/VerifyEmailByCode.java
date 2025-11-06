@@ -19,7 +19,6 @@ package fr.redfroggy.keycloak.requiredactions;
 
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
-import jakarta.ws.rs.core.UriBuilderException;
 import org.jboss.logging.Logger;
 import org.keycloak.Config;
 import org.keycloak.authentication.RequiredActionContext;
@@ -49,25 +48,40 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
- * @version $Revision: 1 $
+ * Required action that verifies user's email by sending a verification code.
  */
 public class VerifyEmailByCode implements RequiredActionProvider, RequiredActionFactory, ServerInfoAwareProviderFactory {
-    public static final String VERIFY_EMAIL_CODE = "VERIFY_EMAIL_CODE";
-    public static final String EMAIL_CODE = "email_code";
-    public static final String INVALID_CODE = "VerifyEmailInvalidCode";
-    public static final String EXPIRED_CODE = "VerifyEmailExpiredCode"; // 保留，用于错误消息
-    public static final String LOGIN_VERIFY_EMAIL_CODE_TEMPLATE = "login-verify-email-code.ftl";
-    // 移除 CONFIG_* 常量
-    public static final int DEFAULT_CODE_LENGTH = 8;
-    public static final String DEFAULT_CODE_SYMBOLS = String.valueOf(SecretGenerator.ALPHANUM);
-    public static final int DEFAULT_CODE_TTL_SECONDS = 300; // 5 minutes
-    private static final Logger logger = Logger.getLogger(VerifyEmailByCode.class);
-    // 移除实例变量 codeLength, codeSymbols, codeTtlSeconds
-    // private int codeLength;
-    // private String codeSymbols;
-    // private int codeTtlSeconds;
 
+    /** Provider ID for this required action */
+    public static final String VERIFY_EMAIL_CODE = "VERIFY_EMAIL_CODE";
+    
+    /** Authentication session note key for email verification timestamp */
+    public static final String VERIFY_EMAIL_CODE_TS = VERIFY_EMAIL_CODE + "_ts";
+    
+    /** Form parameter name for the email verification code */
+    public static final String EMAIL_CODE = "email_code";
+    
+    /** Error message key for invalid verification code */
+    public static final String INVALID_CODE = "VerifyEmailInvalidCode";
+    
+    /** Template name for the verification code input form */
+    public static final String LOGIN_VERIFY_EMAIL_CODE_TEMPLATE = "login-verify-email-code.ftl";
+    
+    /** Configuration key for the length of the verification code */
+    public static final String CONFIG_CODE_LENGTH = "code-length";
+    
+    /** Configuration key for the character set used to generate the code */
+    public static final String CONFIG_CODE_SYMBOLS = "code-symbols";
+    
+    /** Default length of the verification code */
+    public static final int DEFAULT_CODE_LENGTH = 8;
+    
+    /** Default character set for the verification code (alphanumeric) */
+    public static final String DEFAULT_CODE_SYMBOLS = String.valueOf(SecretGenerator.ALPHANUM);
+
+    private static final Logger logger = Logger.getLogger(VerifyEmailByCode.class);
+    private int codeLength;
+    private String codeSymbols;
 
     private static void createFormChallenge(RequiredActionContext context, FormMessage errorMessage) {
         LoginFormsProvider loginFormsProvider = context.form();
@@ -93,7 +107,7 @@ public class VerifyEmailByCode implements RequiredActionProvider, RequiredAction
     public void requiredActionChallenge(RequiredActionContext context) {
         if (context.getUser().isEmailVerified()) {
             context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
-            context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE + "_EXP"); // 确保清理过期时间
+            context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
             context.success();
             return;
         }
@@ -104,46 +118,64 @@ public class VerifyEmailByCode implements RequiredActionProvider, RequiredAction
             return;
         }
 
-        // Only send the code if it does not exist or is expired. This avoids resending on language switch.
-        sendVerifyEmailIfNeededAndCreateForm(context);
+        String storedCode = context.getAuthenticationSession().getAuthNote(VERIFY_EMAIL_CODE);
+        String storedTimeStr = context.getAuthenticationSession().getAuthNote(VERIFY_EMAIL_CODE_TS);
+
+        // 检查验证码是否过期（5分钟）
+        if (storedCode != null && storedTimeStr != null) {
+            try {
+                long sentAt = Long.parseLong(storedTimeStr);
+                long now = System.currentTimeMillis();
+                if (now - sentAt > 5 * 60 * 1000) {
+                    // 过期，清除
+                    context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
+                    context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
+                    storedCode = null;
+                }
+            } catch (NumberFormatException e) {
+                // 时间戳无效，视为过期
+                context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
+                context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
+                storedCode = null;
+            }
+        }
+
+        if (storedCode == null) {
+            sendVerifyEmailAndCreateForm(context);
+        } else {
+            createFormChallenge(context, null);
+        }
     }
 
     @Override
     public void processAction(RequiredActionContext context) {
         EventBuilder event = context.getEvent().clone().event(EventType.VERIFY_EMAIL).detail(Details.EMAIL, context.getUser().getEmail());
-        AuthenticationSessionModel authSession = context.getAuthenticationSession();
-        String code = authSession.getAuthNote(VERIFY_EMAIL_CODE);
-        String expireAtMsStr = authSession.getAuthNote(VERIFY_EMAIL_CODE + "_EXP");
-        if (code == null) {
-            requiredActionChallenge(context); // Should not happen if UI is consistent, but handle gracefully
+        MultivaluedMap<String, String> formData = context.getHttpRequest().getDecodedFormParameters();
+
+        // 处理重发请求
+        if ("true".equals(formData.getFirst("resend"))) {
+            context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
+            context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
+            sendVerifyEmailAndCreateForm(context);
             return;
         }
-        // Check expiration
-        if (expireAtMsStr != null) {
-            try {
-                long expireAtMs = Long.parseLong(expireAtMsStr);
-                if (System.currentTimeMillis() >= expireAtMs) {
-                    createFormChallenge(context, new FormMessage(EMAIL_CODE, EXPIRED_CODE));
-                    // regenerate and send a fresh code for the next attempt
-                    sendNewVerificationCode(context);
-                    return;
-                }
-            } catch (NumberFormatException ignored) {
-                logger.warn("Stored expiration time for verification code is malformed, proceeding without expiration check.");
-                // proceed without expiration if stored value is malformed
-            }
-        }
-        MultivaluedMap<String, String> formData = context.getHttpRequest().getDecodedFormParameters();
-        String emailCode = formData.getFirst(EMAIL_CODE);
 
+        String code = context.getAuthenticationSession().getAuthNote(VERIFY_EMAIL_CODE);
+        if (code == null) {
+            requiredActionChallenge(context);
+            return;
+        }
+
+        String emailCode = formData.getFirst(EMAIL_CODE);
         if (!code.equals(emailCode)) {
             createFormChallenge(context, new FormMessage(EMAIL_CODE, INVALID_CODE));
             event.error(INVALID_CODE);
             return;
         }
+
         context.getUser().setEmailVerified(true);
-        authSession.removeAuthNote(VERIFY_EMAIL_CODE);
-        authSession.removeAuthNote(VERIFY_EMAIL_CODE + "_EXP");
+        context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE);
+        context.getAuthenticationSession().removeAuthNote(VERIFY_EMAIL_CODE_TS);
         event.success();
         context.success();
     }
@@ -155,18 +187,16 @@ public class VerifyEmailByCode implements RequiredActionProvider, RequiredAction
 
     @Override
     public void init(Config.Scope config) {
-        // 固定配置：不再从 Keycloak 控制台动态读取
-        // 无需设置实例变量，直接在使用处引用 DEFAULT_* 常量
+        codeLength = config.getInt(CONFIG_CODE_LENGTH, DEFAULT_CODE_LENGTH);
+        codeSymbols = config.get(CONFIG_CODE_SYMBOLS, DEFAULT_CODE_SYMBOLS);
     }
 
     @Override
     public void postInit(KeycloakSessionFactory factory) {
-
     }
 
     @Override
     public void close() {
-
     }
 
     @Override
@@ -174,87 +204,50 @@ public class VerifyEmailByCode implements RequiredActionProvider, RequiredAction
         return VERIFY_EMAIL_CODE;
     }
 
-    private void sendVerifyEmailIfNeededAndCreateForm(RequiredActionContext context) throws UriBuilderException, IllegalArgumentException {
+    private void sendVerifyEmailAndCreateForm(RequiredActionContext context) {
         KeycloakSession session = context.getSession();
         UserModel user = context.getUser();
         AuthenticationSessionModel authSession = context.getAuthenticationSession();
         EventBuilder event = context.getEvent().clone().event(EventType.SEND_VERIFY_EMAIL).detail(Details.EMAIL, user.getEmail());
 
-        String existingCode = authSession.getAuthNote(VERIFY_EMAIL_CODE);
-        String expireAtMsStr = authSession.getAuthNote(VERIFY_EMAIL_CODE + "_EXP");
-        boolean shouldSend = true;
+        String code = SecretGenerator.getInstance().randomString(codeLength, codeSymbols.toCharArray());
         long now = System.currentTimeMillis();
-        if (existingCode != null && expireAtMsStr != null) {
-            try {
-                long expireAtMs = Long.parseLong(expireAtMsStr);
-                if (now < expireAtMs) {
-                    shouldSend = false; // still valid; don't resend
-                }
-            } catch (NumberFormatException ignored) {
-                logger.warn("Stored expiration time for verification code is malformed, will regenerate code.");
-                // fall through and regenerate
-            }
-        }
-        String code;
-        if (shouldSend) {
-            code = SecretGenerator.getInstance().randomString(DEFAULT_CODE_LENGTH, DEFAULT_CODE_SYMBOLS.toCharArray());
-            authSession.setAuthNote(VERIFY_EMAIL_CODE, code);
-            long expireAtMs = now + (DEFAULT_CODE_TTL_SECONDS * 1000L);
-            authSession.setAuthNote(VERIFY_EMAIL_CODE + "_EXP", String.valueOf(expireAtMs));
-        } else {
-            code = existingCode;
-        }
-        RealmModel realm = session.getContext().getRealm();
 
+        authSession.setAuthNote(VERIFY_EMAIL_CODE, code);
+        authSession.setAuthNote(VERIFY_EMAIL_CODE_TS, String.valueOf(now));
+
+        RealmModel realm = session.getContext().getRealm();
         Map<String, Object> attributes = new HashMap<>();
         attributes.put("code", code);
 
         LoginFormsProvider form = context.form();
-        if (shouldSend) {
-            try {
-                session
-                        .getProvider(EmailTemplateProvider.class)
-                        .setAuthenticationSession(authSession)
-                        .setRealm(realm)
-                        .setUser(user)
-                        .send("emailVerificationSubject", "email-verification-with-code.ftl", attributes);
-                event.success();
-            } catch (EmailException e) {
-                logger.error("Failed to send verification email", e);
-                event.error(Errors.EMAIL_SEND_FAILED);
-                form.setError(Errors.EMAIL_SEND_FAILED);
-            }
+        try {
+            session
+                    .getProvider(EmailTemplateProvider.class)
+                    .setAuthenticationSession(authSession)
+                    .setRealm(realm)
+                    .setUser(user)
+                    .send("emailVerificationSubject", "email-verification-with-code.ftl", attributes);
+            event.success();
+        } catch (EmailException e) {
+            logger.error("Failed to send verification email", e);
+            event.error(Errors.EMAIL_SEND_FAILED);
+            form.setError(Errors.EMAIL_SEND_FAILED);
         }
 
         createFormChallenge(context, null);
     }
 
-    private void sendNewVerificationCode(RequiredActionContext context) {
-        // Helper to regenerate and send a fresh code (used on expiration)
-        AuthenticationSessionModel authSession = context.getAuthenticationSession();
-        authSession.removeAuthNote(VERIFY_EMAIL_CODE);
-        authSession.removeAuthNote(VERIFY_EMAIL_CODE + "_EXP");
-        // Call sendVerifyEmailIfNeededAndCreateForm which will definitely send a new code now that old ones are removed
-        sendVerifyEmailIfNeededAndCreateForm(context);
-    }
-
-
     @Override
     public String getDisplayText() {
-        logger.info("Retrieved display text for VerifyEmailByCode");
         return "Verify Email by code";
     }
 
     @Override
     public Map<String, String> getOperationalInfo() {
-        // 既然配置已固定，OperationalInfo 可以反映这一点，或者简化
-        // 保持原有输出，但明确是固定值
         Map<String, String> ret = new LinkedHashMap<>();
-        ret.put("Fixed Code Length", String.valueOf(DEFAULT_CODE_LENGTH));
-        ret.put("Fixed Code Symbols", DEFAULT_CODE_SYMBOLS);
-        ret.put("Fixed Code TTL (seconds)", String.valueOf(DEFAULT_CODE_TTL_SECONDS));
+        ret.put(VERIFY_EMAIL_CODE + "." + CONFIG_CODE_LENGTH, String.valueOf(codeLength));
+        ret.put(VERIFY_EMAIL_CODE + "." + CONFIG_CODE_SYMBOLS, codeSymbols);
         return ret;
     }
-
-    // 已移除控制台可配置项定义
 }
